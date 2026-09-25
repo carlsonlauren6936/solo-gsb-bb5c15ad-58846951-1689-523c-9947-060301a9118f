@@ -88,9 +88,37 @@ CREATE TABLE IF NOT EXISTS session_executions (
   UNIQUE (session_id, item_id)
 );
 
+-- 修订建议：针对冻结场次条目提出新的提示内容/备注，建议保存在场次下
+-- snap_* 为提出建议时固化的核对基线（取自条目冻结快照 + 当时的剧本版本/绑定行）；
+-- 采纳时在同一事务内核对来源提示与基线，任一不符转为 conflict 并保留建议，
+-- 绝不覆盖排练后对来源提示的编辑。场次快照（session_items）与执行记录永不被采纳流程修改。
+CREATE TABLE IF NOT EXISTS session_suggestions (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  item_id         INTEGER NOT NULL REFERENCES session_items(id) ON DELETE CASCADE,
+  cue_id          INTEGER,                       -- 来源提示 ID（来源日后可能被删除，不建外键）
+  snap_type       TEXT    NOT NULL,              -- 基线：条目冻结的提示类型
+  snap_label      TEXT    NOT NULL,              -- 基线：条目冻结的提示内容
+  snap_note       TEXT    NOT NULL DEFAULT '',   -- 基线：条目冻结的备注
+  snap_version    INTEGER NOT NULL,              -- 基线：提出建议时剧本当前版本
+  snap_line_no    INTEGER NOT NULL,              -- 基线：提出建议时来源提示的绑定行
+  new_type        TEXT    NOT NULL CHECK (new_type IN ('light', 'sound')),
+  new_label       TEXT    NOT NULL,              -- 建议的新提示内容
+  new_note        TEXT    NOT NULL DEFAULT '',   -- 建议的新备注
+  note            TEXT    NOT NULL DEFAULT '',   -- 修订说明（排练组内部沟通用）
+  status          TEXT    NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'adopted', 'conflict')),
+  conflict_reason TEXT,
+  created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+  adopted_at      TEXT,
+  UNIQUE (session_id, item_id)                   -- 一条冻结条目至多一条建议
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_script ON sessions(script_id);
 CREATE INDEX IF NOT EXISTS idx_session_items_session ON session_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_exec_session ON session_executions(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_sugg_session ON session_suggestions(session_id);
 `);
 
 module.exports = db;

@@ -302,7 +302,7 @@ function countPendingCues(scriptId) {
     .get(scriptId).n;
 }
 
-/** 组装场次完整状态（含冻结条目快照、进度与执行记录） */
+/** 组装场次完整状态（含冻结条目快照、进度、执行记录与修订建议） */
 function serializeSession(session) {
   const items = db
     .prepare('SELECT * FROM session_items WHERE session_id = ? ORDER BY seq ASC')
@@ -319,6 +319,11 @@ function serializeSession(session) {
     .all(session.id);
   const executedItemIds = new Set(execs.map((x) => x.item_id));
 
+  const suggestions = db
+    .prepare('SELECT * FROM session_suggestions WHERE session_id = ?')
+    .all(session.id);
+  const suggestionByItem = new Map(suggestions.map((sg) => [sg.item_id, sg]));
+
   return {
     ...session,
     progress: execs.length,
@@ -326,7 +331,13 @@ function serializeSession(session) {
     items: items.map((it) => ({
       ...it,
       executed: executedItemIds.has(it.id),
+      suggestion: suggestionByItem.get(it.id) || null,
     })),
+    suggestion_stats: {
+      pending: suggestions.filter((sg) => sg.status === 'pending').length,
+      conflict: suggestions.filter((sg) => sg.status === 'conflict').length,
+      adopted: suggestions.filter((sg) => sg.status === 'adopted').length,
+    },
     executions: execs,
   };
 }
@@ -395,7 +406,13 @@ app.get('/api/scripts/:id/sessions', (req, res) => {
   const sessions = db
     .prepare(
       `SELECT s.*,
-              (SELECT COUNT(*) FROM session_executions e WHERE e.session_id = s.id) AS progress
+              (SELECT COUNT(*) FROM session_executions e WHERE e.session_id = s.id) AS progress,
+              (SELECT COUNT(*) FROM session_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'pending') AS suggestion_pending,
+              (SELECT COUNT(*) FROM session_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'conflict') AS suggestion_conflict,
+              (SELECT COUNT(*) FROM session_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'adopted') AS suggestion_adopted
        FROM sessions s
        WHERE s.script_id = ?
        ORDER BY s.created_at DESC, s.id DESC`
@@ -490,6 +507,258 @@ app.post('/api/sessions/:sessionId/undo', (req, res) => {
   })();
 
   res.json({ ok: true, progress: result });
+});
+
+/* ------------------------- 场次条目修订建议 ------------------------- */
+
+function getItemOwnedBySession(session, itemId) {
+  const item = db
+    .prepare('SELECT * FROM session_items WHERE id = ? AND session_id = ?')
+    .get(itemId, session.id);
+  if (!item) {
+    const e = new Error('该条目不属于此场次或不存在');
+    e.status = 404;
+    throw e;
+  }
+  return item;
+}
+
+/** 解析建议提交内容：新提示类型/内容必填，新备注与修订说明可空 */
+function parseSuggestionBody(body) {
+  const type = body.type;
+  validateType(type);
+  const label = body.label !== undefined ? String(body.label).trim() : '';
+  if (!label) {
+    const e = new Error('请填写建议的新提示内容');
+    e.status = 400;
+    throw e;
+  }
+  return {
+    type,
+    label,
+    newNote: body.note !== undefined ? String(body.note).trim() : '',
+    note: body.suggestionNote !== undefined ? String(body.suggestionNote).trim() : '',
+  };
+}
+
+/**
+ * 采纳事务内的冲突分支：把冲突原因落库（随事务提交以保留建议），
+ * 返回事务结果对象，由路由在事务外返回 409。
+ */
+function markSuggestionConflict(txDb, sg, reason) {
+  txDb
+    .prepare(
+      `UPDATE session_suggestions
+       SET status = 'conflict', conflict_reason = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(reason, sg.id);
+  return { kind: 'conflict', reason, id: sg.id };
+}
+
+// 为冻结条目提交/修改修订建议（一条条目至多一条建议；待处理与冲突状态均可修改）
+app.put('/api/sessions/:sessionId/items/:itemId/suggestion', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const item = getItemOwnedBySession(session, req.params.itemId);
+  const { type, label, newNote, note } = parseSuggestionBody(req.body);
+
+  const existing = db
+    .prepare('SELECT * FROM session_suggestions WHERE session_id = ? AND item_id = ?')
+    .get(session.id, item.id);
+  if (existing && existing.status === 'adopted') {
+    return res
+      .status(409)
+      .json({ error: '该建议已采纳，如需再次修订请新建场次或直接修改当前提示' });
+  }
+
+  const script = getScriptOr404(session.script_id);
+
+  const result = db.transaction(() => {
+    if (existing) {
+      db.prepare(
+        `UPDATE session_suggestions
+         SET new_type = ?, new_label = ?, new_note = ?, note = ?,
+             snap_type = ?, snap_label = ?, snap_note = ?,
+             snap_version = ?, snap_line_no = ?,
+             status = 'pending', conflict_reason = NULL, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        type,
+        label,
+        newNote,
+        note,
+        item.type,
+        item.label,
+        item.note,
+        script.current_version,
+        item.line_no,
+        existing.id
+      );
+      return { id: existing.id, created: false };
+    }
+
+    const info = db
+      .prepare(
+        `INSERT INTO session_suggestions
+           (session_id, item_id, cue_id,
+            snap_type, snap_label, snap_note, snap_version, snap_line_no,
+            new_type, new_label, new_note, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        session.id,
+        item.id,
+        item.cue_id,
+        item.type,
+        item.label,
+        item.note,
+        script.current_version,
+        item.line_no,
+        type,
+        label,
+        newNote,
+        note
+      );
+    return { id: info.lastInsertRowid, created: true };
+  })();
+
+  res.status(result.created ? 201 : 200).json({
+    ok: true,
+    id: result.id,
+    suggestion: db
+      .prepare('SELECT * FROM session_suggestions WHERE id = ?')
+      .get(result.id),
+  });
+});
+
+// 采纳建议：同一事务内核对来源提示仍存在、剧本版本与绑定行未变、
+// 类型/内容/备注与条目冻结快照一致；任一不符 -> 建议转 conflict（保留），409
+app.post('/api/sessions/:sessionId/suggestions/:suggestionId/adopt', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+
+  const outcome = db.transaction(() => {
+    const sg = db
+      .prepare('SELECT * FROM session_suggestions WHERE id = ? AND session_id = ?')
+      .get(req.params.suggestionId, session.id);
+    if (!sg) {
+      const e = new Error('建议不存在或不属于此场次');
+      e.status = 404;
+      throw e;
+    }
+    if (sg.status === 'adopted') {
+      return { kind: 'already-adopted', id: sg.id };
+    }
+
+    const item = db
+      .prepare('SELECT * FROM session_items WHERE id = ?')
+      .get(sg.item_id);
+
+    // 1) 建议中固化的条目快照必须仍与冻结条目一致（防御性核对：条目本不可变）
+    if (
+      !item ||
+      item.session_id !== session.id ||
+      item.type !== sg.snap_type ||
+      item.label !== sg.snap_label ||
+      item.note !== sg.snap_note
+    ) {
+      return markSuggestionConflict(db, sg, '条目冻结快照已变化，无法安全采纳');
+    }
+
+    // 2) 来源提示必须仍存在
+    const cue = sg.cue_id
+      ? db.prepare('SELECT * FROM cues WHERE id = ?').get(sg.cue_id)
+      : null;
+    if (!cue || cue.script_id !== session.script_id) {
+      return markSuggestionConflict(
+        db,
+        sg,
+        '来源提示已被删除，无法采纳；请在提示单中重建后手工修改'
+      );
+    }
+
+    // 3) 剧本版本必须与提出建议时一致（改版后来源提示可能已重新定位）
+    const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(session.script_id);
+    if (!script) {
+      return markSuggestionConflict(db, sg, '剧本已不存在');
+    }
+    if (script.current_version !== sg.snap_version) {
+      return markSuggestionConflict(
+        db,
+        sg,
+        `剧本已升级到第 ${script.current_version} 版（建议基于第 ${sg.snap_version} 版），请核对后修改建议再采纳`
+      );
+    }
+
+    // 4) 绑定行必须未变（重绑、重新定位都会改变行号）
+    if (cue.anchor_status !== 'bound' || cue.line_no == null) {
+      return markSuggestionConflict(db, sg, '来源提示当前处于待确认状态，未绑定台词，无法采纳');
+    }
+    if (cue.line_no !== sg.snap_line_no) {
+      return markSuggestionConflict(
+        db,
+        sg,
+        `来源提示绑定行已变化（现为第 ${cue.line_no} 行，建议基于第 ${sg.snap_line_no} 行）`
+      );
+    }
+
+    // 5) 来源提示当前的类型/内容/备注必须与冻结快照一致，
+    //    不一致说明排练后已有人直接编辑过来源提示 —— 不能覆盖
+    if (
+      cue.type !== sg.snap_type ||
+      cue.label !== sg.snap_label ||
+      cue.note !== sg.snap_note
+    ) {
+      return markSuggestionConflict(
+        db,
+        sg,
+        '来源提示在冻结后已被直接编辑（类型/内容/备注与快照不一致），为避免覆盖该修改，请核对后修改或放弃建议'
+      );
+    }
+
+    // 核对通过：只更新来源提示的当前内容（不改锚点/版本/行号）；
+    // session_items 冻结快照与 session_executions 执行记录保持原样
+    db.prepare(
+      `UPDATE cues SET type = ?, label = ?, note = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(sg.new_type, sg.new_label, sg.new_note, cue.id);
+
+    db.prepare(
+      `UPDATE session_suggestions
+       SET status = 'adopted', conflict_reason = NULL,
+           adopted_at = datetime('now'), updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(sg.id);
+
+    return { kind: 'ok', id: sg.id };
+  })();
+
+  const suggestion = db
+    .prepare('SELECT * FROM session_suggestions WHERE id = ?')
+    .get(outcome.id);
+
+  if (outcome.kind === 'conflict') {
+    // 冲突状态已随事务提交（建议保留），场次快照与执行记录均未改动
+    return res
+      .status(409)
+      .json({ error: outcome.reason, conflict: true, suggestion });
+  }
+  if (outcome.kind === 'already-adopted') {
+    return res.status(409).json({ error: '该建议已采纳，不能重复采纳', suggestion });
+  }
+  res.json({ ok: true, suggestion });
+});
+
+// 删除建议（仅待处理/冲突状态；已采纳的建议作为审计痕迹保留）
+app.delete('/api/sessions/:sessionId/suggestions/:suggestionId', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const sg = db
+    .prepare('SELECT * FROM session_suggestions WHERE id = ? AND session_id = ?')
+    .get(req.params.suggestionId, session.id);
+  if (!sg) return res.status(404).json({ error: '建议不存在或不属于此场次' });
+  if (sg.status === 'adopted') {
+    return res.status(409).json({ error: '已采纳的建议不能删除（保留采纳记录）' });
+  }
+  db.prepare('DELETE FROM session_suggestions WHERE id = ?').run(sg.id);
+  res.json({ ok: true });
 });
 
 /* ----------------------------- 错误处理 ----------------------------- */

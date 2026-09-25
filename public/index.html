@@ -142,6 +142,30 @@
     </div>
   </div>
 
+  <!-- 冻结条目修订建议弹窗 -->
+  <div id="sugModal" class="modal-mask hidden">
+    <div class="modal">
+      <h3 id="sugModalTitle">修订建议</h3>
+      <div class="modal-line" id="sugModalItem"></div>
+      <p class="hint" id="sugModalHint"></p>
+      <label class="field-label">建议的提示类型</label>
+      <div class="type-switch">
+        <label><input type="radio" name="sugType" value="light" checked /> 💡 灯光</label>
+        <label><input type="radio" name="sugType" value="sound" /> 🔊 音效</label>
+      </div>
+      <label class="field-label">建议的新提示内容</label>
+      <input id="sugLabel" class="input" type="text" placeholder="如：聚光灯打向周朴园 / 雷声渐起" />
+      <label class="field-label">建议的新备注（可选）</label>
+      <textarea id="sugNote" class="textarea" rows="2" placeholder="执行细节、时长、通道等"></textarea>
+      <label class="field-label">修订说明（可选，随建议保存）</label>
+      <textarea id="sugReason" class="textarea" rows="2" placeholder="如：今晚排练导演要求把雷声提前两秒"></textarea>
+      <div class="modal-actions">
+        <button class="btn" id="sugCancelBtn">取消</button>
+        <button class="btn btn-primary" id="sugSaveBtn">保存建议</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="app.js"></script>
