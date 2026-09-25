@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台词提示单 · 剧团排练工具</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" id="homeBtn" title="返回剧本列表">
+      <span class="brand-mark">🎭</span>
+      <span>台词提示单</span>
+    </div>
+    <div class="topbar-sub" id="topbarSub">灯光 / 音效提示管理</div>
+  </header>
+
+  <!-- 剧本列表视图 -->
+  <main id="listView" class="view">
+    <section class="panel create-panel">
+      <h2>新建剧本</h2>
+      <p class="hint">粘贴分场剧本文本，保存后可以在任意台词旁添加灯光或音效提示。</p>
+      <input id="newTitle" class="input" type="text" placeholder="剧本标题，如：雷雨（第三幕）" />
+      <textarea id="newContent" class="textarea" rows="8" placeholder="在此粘贴剧本文本，每行一句台词或舞台提示……"></textarea>
+      <button class="btn btn-primary" id="createBtn">创建剧本</button>
+    </section>
+
+    <section class="panel">
+      <h2>剧本列表</h2>
+      <div id="scriptList" class="script-list"></div>
+    </section>
+  </main>
+
+  <!-- 剧本详情视图 -->
+  <main id="detailView" class="view hidden">
+    <div class="detail-head">
+      <button class="btn btn-ghost" id="backBtn">← 返回列表</button>
+      <h2 id="detailTitle" class="detail-title"></h2>
+      <span id="versionBadge" class="badge badge-version"></span>
+      <div class="detail-actions">
+        <button class="btn" id="renameBtn">改标题</button>
+        <button class="btn btn-warn hidden" id="editBtn">编辑剧本（保存新版）</button>
+        <button class="btn btn-primary hidden" id="saveVersionBtn">保存新版</button>
+        <button class="btn hidden" id="cancelEditBtn">取消</button>
+      </div>
+    </div>
+
+    <div class="tab-bar">
+      <button class="tab-btn active" id="tabCueBtn">🎬 剧本与提示单</button>
+      <button class="tab-btn" id="tabRunBtn">🗂️ 排练执行台</button>
+    </div>
+
+    <div id="cueTab">
+      <div class="detail-grid">
+        <!-- 左：剧本 -->
+        <section class="panel script-panel">
+          <div class="panel-head">
+            <h3 id="scriptPanelTitle">剧本</h3>
+            <span class="hint" id="scriptModeHint">点击任意台词行，可在旁边添加提示</span>
+          </div>
+
+          <div id="scriptViewer" class="script-viewer"></div>
+          <textarea id="scriptEditor" class="textarea script-editor hidden" rows="24"></textarea>
+        </section>
+
+        <!-- 右：提示单 -->
+        <section class="panel cues-panel">
+          <div class="panel-head">
+            <h3>提示单</h3>
+            <div id="cueStats" class="cue-stats"></div>
+          </div>
+          <div id="pendingPanel" class="pending-panel hidden"></div>
+          <div id="cueList" class="cue-list"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- 排练执行台 -->
+    <div id="runTab" class="hidden">
+      <div class="detail-grid run-grid">
+        <!-- 左：创建场次 + 当前场次执行 -->
+        <section class="panel">
+          <div class="panel-head">
+            <h3>创建排练场次</h3>
+          </div>
+          <div id="runCreateBox" class="run-create-box">
+            <div id="runPreview" class="hint">正在读取当前版本提示…</div>
+            <div class="run-create-form">
+              <input id="runName" class="input" type="text" placeholder="场次名称（可选，默认「剧名 · 第N版排练」）" />
+              <button class="btn btn-primary" id="runCreateBtn">从当前版本创建场次</button>
+            </div>
+          </div>
+
+          <div id="activeSessionBox" class="run-active-box"></div>
+        </section>
+
+        <!-- 右：历次场次 -->
+        <section class="panel">
+          <div class="panel-head">
+            <h3>历次场次</h3>
+            <span class="hint">快照与执行记录永久保留，剧本改版不影响旧场次</span>
+          </div>
+          <div id="sessionHistory" class="session-history"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- 添加/编辑提示弹窗 -->
+  <div id="cueModal" class="modal-mask hidden">
+    <div class="modal">
+      <h3 id="cueModalTitle">添加提示</h3>
+      <div class="modal-line" id="cueModalLine"></div>
+      <label class="field-label">提示类型</label>
+      <div class="type-switch">
+        <label><input type="radio" name="cueType" value="light" checked /> 💡 灯光</label>
+        <label><input type="radio" name="cueType" value="sound" /> 🔊 音效</label>
+      </div>
+      <label class="field-label">提示内容</label>
+      <input id="cueLabel" class="input" type="text" placeholder="如：聚光灯打向周朴园 / 雷声渐起" />
+      <label class="field-label">备注（可选）</label>
+      <textarea id="cueNote" class="textarea" rows="2" placeholder="执行细节、时长、通道等"></textarea>
+      <div class="modal-actions">
+        <button class="btn" id="cueCancelBtn">取消</button>
+        <button class="btn btn-primary" id="cueSaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重新绑定弹窗 -->
+  <div id="rebindModal" class="modal-mask hidden">
+    <div class="modal modal-lg">
+      <h3>重新绑定台词</h3>
+      <div id="rebindCueInfo" class="rebind-cue-info"></div>
+      <p class="hint" id="rebindReason"></p>
+      <div id="rebindCandidates" class="rebind-candidates"></div>
+      <label class="field-label">或在下面剧本中点选正确的台词行</label>
+      <div id="rebindViewer" class="script-viewer rebind-viewer"></div>
+      <div class="modal-actions">
+        <button class="btn" id="rebindCancelBtn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

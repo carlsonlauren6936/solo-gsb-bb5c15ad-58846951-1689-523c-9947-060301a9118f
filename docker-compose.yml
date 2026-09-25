@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    image: line-cue-sheet:latest
+    container_name: line-cue-sheet
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # 容器内数据库文件路径；如需修改端口，同时调整左侧宿主机映射端口
+      PORT: 3000
+      DB_PATH: /app/data/cues.db
+    volumes:
+      - cue-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  cue-data:
