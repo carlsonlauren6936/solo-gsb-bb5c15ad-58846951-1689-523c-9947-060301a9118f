@@ -88,9 +88,27 @@ CREATE TABLE IF NOT EXISTS session_executions (
   UNIQUE (session_id, item_id)
 );
 
+-- 场次条目修订建议：排练时对冻结条目提出的新提示内容/备注，保存在场次下。
+-- 采纳时事务内核对来源提示与条目快照一致才回写 cues；核对失败标记 conflict 并保留建议。
+-- 已采纳的建议作为历史保留，不可再修改或删除。
+CREATE TABLE IF NOT EXISTS session_item_suggestions (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  item_id         INTEGER NOT NULL REFERENCES session_items(id) ON DELETE CASCADE,
+  label           TEXT    NOT NULL,              -- 建议的新提示内容
+  note            TEXT    NOT NULL DEFAULT '',   -- 建议的新备注
+  status          TEXT    NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'adopted', 'conflict')),
+  conflict_reason TEXT,                          -- 采纳核对失败的原因（建议本身保留）
+  created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_script ON sessions(script_id);
 CREATE INDEX IF NOT EXISTS idx_session_items_session ON session_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_exec_session ON session_executions(session_id);
+CREATE INDEX IF NOT EXISTS idx_suggestions_session ON session_item_suggestions(session_id);
+CREATE INDEX IF NOT EXISTS idx_suggestions_item ON session_item_suggestions(item_id);
 `);
 
 module.exports = db;

@@ -302,7 +302,7 @@ function countPendingCues(scriptId) {
     .get(scriptId).n;
 }
 
-/** 组装场次完整状态（含冻结条目快照、进度与执行记录） */
+/** 组装场次完整状态（含冻结条目快照、进度、执行记录与修订建议） */
 function serializeSession(session) {
   const items = db
     .prepare('SELECT * FROM session_items WHERE session_id = ? ORDER BY seq ASC')
@@ -317,7 +317,22 @@ function serializeSession(session) {
        ORDER BY e.seq ASC`
     )
     .all(session.id);
+  const suggestions = db
+    .prepare(
+      `SELECT g.*, i.seq AS item_seq, i.line_no AS item_line_no,
+              i.label AS item_label, i.note AS item_note
+       FROM session_item_suggestions g
+       JOIN session_items i ON i.id = g.item_id
+       WHERE g.session_id = ?
+       ORDER BY g.id ASC`
+    )
+    .all(session.id);
   const executedItemIds = new Set(execs.map((x) => x.item_id));
+  const sugByItem = new Map();
+  for (const g of suggestions) {
+    if (!sugByItem.has(g.item_id)) sugByItem.set(g.item_id, []);
+    sugByItem.get(g.item_id).push(g);
+  }
 
   return {
     ...session,
@@ -326,8 +341,10 @@ function serializeSession(session) {
     items: items.map((it) => ({
       ...it,
       executed: executedItemIds.has(it.id),
+      suggestions: sugByItem.get(it.id) || [],
     })),
     executions: execs,
+    suggestions,
   };
 }
 
@@ -389,13 +406,17 @@ app.post('/api/scripts/:id/sessions', (req, res) => {
   res.status(201).json({ id: sessionId });
 });
 
-// 场次列表（进度摘要）
+// 场次列表（进度摘要 + 修订建议状态计数）
 app.get('/api/scripts/:id/sessions', (req, res) => {
   getScriptOr404(req.params.id);
   const sessions = db
     .prepare(
       `SELECT s.*,
-              (SELECT COUNT(*) FROM session_executions e WHERE e.session_id = s.id) AS progress
+              (SELECT COUNT(*) FROM session_executions e WHERE e.session_id = s.id) AS progress,
+              (SELECT COUNT(*) FROM session_item_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'pending') AS pending_suggestions,
+              (SELECT COUNT(*) FROM session_item_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'conflict') AS conflict_suggestions
        FROM sessions s
        WHERE s.script_id = ?
        ORDER BY s.created_at DESC, s.id DESC`
@@ -490,6 +511,137 @@ app.post('/api/sessions/:sessionId/undo', (req, res) => {
   })();
 
   res.json({ ok: true, progress: result });
+});
+
+/* ----------------------------- 场次条目修订建议 ----------------------------- */
+
+function getSuggestionOr404(suggestionId) {
+  const sug = db
+    .prepare('SELECT * FROM session_item_suggestions WHERE id = ?')
+    .get(suggestionId);
+  if (!sug) {
+    const e = new Error('建议不存在');
+    e.status = 404;
+    throw e;
+  }
+  return sug;
+}
+
+// 为冻结条目提交修订建议（新的提示内容 + 备注），保存在场次下
+app.post('/api/sessions/:sessionId/items/:itemId/suggestions', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const item = db
+    .prepare('SELECT * FROM session_items WHERE id = ? AND session_id = ?')
+    .get(Number(req.params.itemId), session.id);
+  if (!item) return res.status(404).json({ error: '场次条目不存在' });
+
+  const label = String(req.body.label || '').trim();
+  const note = String(req.body.note || '').trim();
+  if (!label) return res.status(400).json({ error: '请填写建议的提示内容' });
+
+  const info = db
+    .prepare(
+      `INSERT INTO session_item_suggestions (session_id, item_id, label, note)
+       VALUES (?, ?, ?, ?)`
+    )
+    .run(session.id, item.id, label, note);
+  res.status(201).json({ id: info.lastInsertRowid });
+});
+
+// 修改建议：仅未采纳的建议可改；修改后回到待处理状态，可再次尝试采纳
+app.patch('/api/suggestions/:suggestionId', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+  if (sug.status === 'adopted') {
+    return res.status(409).json({ error: '该建议已被采纳，作为历史记录保留，不能再修改' });
+  }
+
+  const label = req.body.label !== undefined ? String(req.body.label).trim() : sug.label;
+  if (!label) return res.status(400).json({ error: '请填写建议的提示内容' });
+  const note = req.body.note !== undefined ? String(req.body.note).trim() : sug.note;
+
+  db.prepare(
+    `UPDATE session_item_suggestions
+     SET label = ?, note = ?, status = 'pending', conflict_reason = NULL,
+         updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(label, note, sug.id);
+  res.json({ ok: true });
+});
+
+// 删除（撤回）建议：已采纳的作为历史保留，不可删除
+app.delete('/api/suggestions/:suggestionId', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+  if (sug.status === 'adopted') {
+    return res.status(409).json({ error: '该建议已被采纳，作为历史记录保留，不能删除' });
+  }
+  db.prepare('DELETE FROM session_item_suggestions WHERE id = ?').run(sug.id);
+  res.json({ ok: true });
+});
+
+/**
+ * 采纳建议：同一事务内核对——
+ *   1. 来源提示仍存在；
+ *   2. 剧本当前版本与场次冻结版本一致，且提示仍绑定在快照行；
+ *   3. 提示的类型、内容、备注与条目快照一致（即排练后无人改过）。
+ * 任一不符：标记建议为冲突并保留（提交该标记），返回 409，绝不覆盖排练后的编辑；
+ * 全部通过：把建议的内容/备注写回当前提示，并标记建议已采纳。
+ * 场次冻结条目与执行记录始终不被改动。
+ */
+app.post('/api/suggestions/:suggestionId/adopt', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+
+  const outcome = db.transaction(() => {
+    if (sug.status === 'adopted') {
+      throw conflict('该建议已被采纳，不能重复采纳');
+    }
+    const item = db.prepare('SELECT * FROM session_items WHERE id = ?').get(sug.item_id);
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sug.session_id);
+    if (!item || !session) throw conflict('场次或条目已不存在');
+
+    let failReason = null;
+    const cue =
+      item.cue_id == null
+        ? null
+        : db.prepare('SELECT * FROM cues WHERE id = ?').get(item.cue_id);
+
+    if (!cue) {
+      failReason = '来源提示已被删除，无法回写';
+    } else {
+      const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(session.script_id);
+      if (!script || script.current_version !== session.script_version) {
+        failReason = `剧本已改版（当前第 ${script ? script.current_version : '?'} 版，场次冻结自第 ${session.script_version} 版）`;
+      } else if (cue.anchor_status !== 'bound' || cue.line_no !== item.line_no) {
+        failReason = '来源提示的绑定行已变化（可能被重新绑定或待确认）';
+      } else if (cue.type !== item.type || cue.label !== item.label || cue.note !== item.note) {
+        failReason = '来源提示的类型/内容/备注已与场次快照不一致（排练后被编辑过）';
+      }
+    }
+
+    if (failReason) {
+      // 保留建议，仅把冲突状态与原因落库，随后以 409 告知调用方
+      db.prepare(
+        `UPDATE session_item_suggestions
+         SET status = 'conflict', conflict_reason = ?, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(failReason, sug.id);
+      return { ok: false, reason: failReason };
+    }
+
+    db.prepare(
+      `UPDATE cues SET label = ?, note = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(sug.label, sug.note, cue.id);
+    db.prepare(
+      `UPDATE session_item_suggestions
+       SET status = 'adopted', conflict_reason = NULL, updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(sug.id);
+    return { ok: true };
+  })();
+
+  if (!outcome.ok) {
+    return res.status(409).json({ error: `采纳失败：${outcome.reason}`, conflict: true });
+  }
+  res.json({ ok: true });
 });
 
 /* ----------------------------- 错误处理 ----------------------------- */

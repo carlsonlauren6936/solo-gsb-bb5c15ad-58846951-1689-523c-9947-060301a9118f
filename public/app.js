@@ -8,6 +8,7 @@ const state = {
   mode: 'view', // 'view' | 'edit'
   script: null, // 当前剧本详情 { id, title, content, current_version, cues }
   cueModal: null, // { mode:'add', lineNo } | { mode:'edit', cue }
+  suggestModal: null, // { mode:'add', item } | { mode:'edit', suggestion }
   rebindCue: null, // 正在重绑的提示
   rebindTarget: null, // 重绑弹窗中暂选行号
   flashLineNo: null, // 渲染后需要高亮的行
@@ -342,6 +343,12 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  // 排练执行台：修订建议相关操作
+  if (['suggest', 'sug-edit', 'sug-adopt', 'sug-delete'].includes(action)) {
+    await handleSuggestionAction(action, btn);
+    return;
+  }
+
   const cue = cueId ? state.script.cues.find((c) => c.id === cueId) : null;
 
   if (action === 'edit' && cue) {
@@ -488,6 +495,109 @@ $('rebindModal').addEventListener('click', (e) => {
   if (e.target === $('rebindModal')) $('rebindModal').classList.add('hidden');
 });
 
+/* =============================== 修订建议 =============================== */
+
+function openSuggestModal(modalState) {
+  state.suggestModal = modalState;
+  const isAdd = modalState.mode === 'add';
+  const item = isAdd
+    ? modalState.item
+    : state.run.activeSession.items.find((it) => it.id === modalState.suggestion.item_id);
+  if (!item) return toast('场次条目已不存在', true);
+
+  $('suggestModalTitle').textContent = isAdd ? '为冻结条目提修订建议' : '修改修订建议';
+  $('suggestItemInfo').textContent =
+    `#${item.seq} · 第 ${item.line_no} 行：${item.line_text || ''}　｜　快照内容：${item.label}` +
+    (item.note ? `（📝 ${item.note}）` : '');
+  $('suggestLabel').value = isAdd ? item.label : modalState.suggestion.label;
+  $('suggestNote').value = isAdd ? item.note || '' : modalState.suggestion.note || '';
+  $('suggestModal').classList.remove('hidden');
+  $('suggestLabel').focus();
+}
+
+function closeSuggestModal() {
+  state.suggestModal = null;
+  $('suggestModal').classList.add('hidden');
+}
+
+$('suggestCancelBtn').addEventListener('click', closeSuggestModal);
+$('suggestModal').addEventListener('click', (e) => {
+  if (e.target === $('suggestModal')) closeSuggestModal();
+});
+
+$('suggestSaveBtn').addEventListener('click', async () => {
+  const m = state.suggestModal;
+  if (!m) return;
+  const body = { label: $('suggestLabel').value.trim(), note: $('suggestNote').value.trim() };
+  if (!body.label) return toast('请填写建议的提示内容', true);
+
+  const s = state.run.activeSession;
+  try {
+    if (m.mode === 'add') {
+      await api('POST', `/api/sessions/${s.id}/items/${m.item.id}/suggestions`, body);
+      toast('建议已保存，刷新后仍可查看与修改');
+    } else {
+      await api('PATCH', `/api/suggestions/${m.suggestion.id}`, body);
+      toast('建议已更新，状态重置为待处理');
+    }
+    closeSuggestModal();
+    await refreshActiveSession();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+/** 执行台中建议相关按钮：提建议 / 编辑 / 采纳 / 删除 */
+async function handleSuggestionAction(action, btn) {
+  const s = state.run.activeSession;
+  if (!s) return;
+
+  if (action === 'suggest') {
+    const item = s.items.find((it) => it.id === Number(btn.dataset.item));
+    if (item) openSuggestModal({ mode: 'add', item });
+    return;
+  }
+
+  const sug = (s.suggestions || []).find((g) => g.id === Number(btn.dataset.sug));
+  if (!sug) return toast('建议已不存在，请刷新', true);
+
+  if (action === 'sug-edit') {
+    openSuggestModal({ mode: 'edit', suggestion: sug });
+    return;
+  }
+
+  if (action === 'sug-delete') {
+    if (!confirm('确定删除该修订建议？')) return;
+    try {
+      await api('DELETE', `/api/suggestions/${sug.id}`);
+      toast('建议已删除');
+      await refreshActiveSession();
+    } catch (err) {
+      toast(err.message, true);
+    }
+    return;
+  }
+
+  if (action === 'sug-adopt') {
+    try {
+      await api('POST', `/api/suggestions/${sug.id}/adopt`);
+      toast('建议已采纳，当前提示已更新（场次快照保持原样）');
+      // 提示单数据已变化，静默刷新以便切回「剧本与提示单」时看到最新内容
+      state.script = await api('GET', `/api/scripts/${state.script.id}`);
+      await refreshActiveSession();
+    } catch (err) {
+      if (err.status === 409) {
+        // 核对失败：建议被保留并标记冲突，刷新后展示冲突原因
+        toast(`冲突：${err.message}`, true);
+        await refreshActiveSession();
+        refreshHistory();
+      } else {
+        toast(err.message, true);
+      }
+    }
+  }
+}
+
 /* =============================== 标签页切换 =============================== */
 
 function switchTab(tab) {
@@ -614,12 +724,18 @@ function renderActiveSession() {
     </div>`
     : `<div class="run-head run-done">🎉 本场次 ${s.total} 条提示已全部执行完毕</div>`;
 
+  const sugList = s.suggestions || [];
+  const pendingSug = sugList.filter((g) => g.status === 'pending').length;
+  const conflictSug = sugList.filter((g) => g.status === 'conflict').length;
+
   box.innerHTML = `
     <div class="run-session-head">
       <div class="run-session-title">${escapeHtml(s.name)}</div>
       <div class="run-session-meta">
         <span class="badge badge-version">v${s.script_version} 快照</span>
         <span>共 ${s.total} 条 · 已执行 ${s.progress} 条</span>
+        ${pendingSug ? `<span class="badge badge-sug-pending">💬 待处理建议 ${pendingSug}</span>` : ''}
+        ${conflictSug ? `<span class="badge badge-pending">⚠ 冲突建议 ${conflictSug}</span>` : ''}
         ${s.is_complete ? '<span class="badge badge-ok">已完成</span>' : ''}
       </div>
     </div>
@@ -652,6 +768,8 @@ function renderActiveSession() {
             : isHead
               ? '<span class="run-tag tag-head">队首</span>'
               : '<span class="run-tag tag-pending">待执行</span>';
+          const sugs = it.suggestions || [];
+          const sugBadges = renderSugMiniBadges(sugs);
           return `
           <div class="run-item ${cls}">
             <span class="run-item-idx">#${it.seq}</span>
@@ -661,10 +779,23 @@ function renderActiveSession() {
             </span>
             <span class="run-item-line">第 ${it.line_no} 行</span>
             <span class="run-item-label">${escapeHtml(it.label)}</span>
+            ${sugBadges}
+            <span class="run-item-actions">
+              <button class="btn btn-sm" data-action="suggest" data-item="${it.id}">✏️ 建议</button>
+            </span>
             ${it.note ? `<span class="run-item-note">📝 ${escapeHtml(it.note)}</span>` : ''}
           </div>`;
         })
         .join('')}
+    </div>
+
+    <h4 class="run-subhead">修订建议（保存在本场次下）</h4>
+    <div class="sug-list">
+      ${
+        sugList.length === 0
+          ? '<div class="empty" style="padding:12px 0">暂无修订建议。点击队列中条目的「✏️ 建议」即可提出。</div>'
+          : sugList.map((g) => renderSuggestionCard(g)).join('')
+      }
     </div>
 
     <h4 class="run-subhead">执行记录</h4>
@@ -693,6 +824,61 @@ function renderActiveSession() {
 
   $('executeBtn').addEventListener('click', () => executeItem(head.id));
   $('undoBtn').addEventListener('click', undoLast);
+}
+
+/** 队列条目上的建议状态小标记 */
+function renderSugMiniBadges(sugs) {
+  const pending = sugs.filter((g) => g.status === 'pending').length;
+  const conflict = sugs.filter((g) => g.status === 'conflict').length;
+  const adopted = sugs.filter((g) => g.status === 'adopted').length;
+  return (
+    (pending ? `<span class="run-tag tag-sug-pending">💬 建议 ${pending}</span>` : '') +
+    (conflict ? `<span class="run-tag tag-sug-conflict">⚠ 冲突 ${conflict}</span>` : '') +
+    (adopted ? `<span class="run-tag tag-sug-adopted">✓ 已采纳 ${adopted}</span>` : '')
+  );
+}
+
+const SUG_STATUS = {
+  pending: { text: '待处理', cls: 'badge-sug-pending' },
+  conflict: { text: '冲突', cls: 'badge-pending' },
+  adopted: { text: '已采纳', cls: 'badge-ok' },
+};
+
+/** 单条修订建议卡片：展示快照原文 → 建议内容，以及待处理/冲突/已采纳状态 */
+function renderSuggestionCard(g) {
+  const st = SUG_STATUS[g.status] || SUG_STATUS.pending;
+  const actionable = g.status !== 'adopted';
+  return `
+  <div class="sug-item ${g.status === 'conflict' ? 'is-conflict' : ''}">
+    <div class="sug-item-top">
+      <span class="run-item-idx">#${g.item_seq}</span>
+      <span class="run-item-line">第 ${g.item_line_no} 行</span>
+      <span class="badge ${st.cls}">${st.text}</span>
+      <span class="sug-time">${escapeHtml(g.updated_at)}</span>
+    </div>
+    <div class="sug-diff">
+      <div class="sug-diff-row">
+        <span class="sug-diff-tag">快照</span>
+        <span>${escapeHtml(g.item_label)}${g.item_note ? `（📝 ${escapeHtml(g.item_note)}）` : ''}</span>
+      </div>
+      <div class="sug-diff-row">
+        <span class="sug-diff-tag sug-diff-new">建议</span>
+        <span>${escapeHtml(g.label)}${g.note ? `（📝 ${escapeHtml(g.note)}）` : ''}</span>
+      </div>
+    </div>
+    ${g.status === 'conflict' && g.conflict_reason
+      ? `<div class="sug-conflict-reason">⚠ 采纳被驳回：${escapeHtml(g.conflict_reason)}。建议已保留，可修改后重试。</div>`
+      : ''}
+    ${
+      actionable
+        ? `<div class="sug-actions">
+            <button class="btn btn-sm btn-primary" data-action="sug-adopt" data-sug="${g.id}">采纳（写回当前提示）</button>
+            <button class="btn btn-sm" data-action="sug-edit" data-sug="${g.id}">编辑</button>
+            <button class="btn btn-sm btn-danger" data-action="sug-delete" data-sug="${g.id}">删除</button>
+          </div>`
+        : '<div class="hint" style="margin:6px 0 0">已写回当前提示，建议作为历史保留。</div>'
+    }
+  </div>`;
 }
 
 async function executeItem(itemId) {
@@ -769,6 +955,8 @@ function renderSessionHistory() {
         <div class="session-item-meta">
           v${s.script_version} · ${s.total} 条 · 已执行 ${s.progress} 条（${pct}%）
           ${s.excluded_pending ? ` · 排除待确认 ${s.excluded_pending} 条` : ''}
+          ${s.pending_suggestions ? ` · 💬 待处理建议 ${s.pending_suggestions} 条` : ''}
+          ${s.conflict_suggestions ? ` · <span style="color:var(--danger)">⚠ 冲突建议 ${s.conflict_suggestions} 条</span>` : ''}
         </div>
         <div class="session-item-time">创建于 ${escapeHtml(s.created_at)}</div>
       </div>`;

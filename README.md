@@ -95,6 +95,16 @@ npm start            # 启动，访问 http://localhost:3000
    - **刷新恢复**：进度与执行记录全部存在服务端，刷新页面后重新打开场次即恢复。
    - **快照不可变**：剧本改版或提示后续被编辑/删除，**均不改变既有场次**，
      可随时在右侧「历次场次」中查看每一场的冻结快照与执行记录。
+8. **场次条目修订建议**：排练中发现提示文案需要调整时，不必当场改动剧本提示——
+   在执行台点击队列条目的「✏️ 建议」，为**冻结条目**填写新的提示内容和备注：
+   - 建议保存在**场次下**（`session_item_suggestions`），刷新页面后仍可查看、修改或删除；
+     修改建议会将其重置为**待处理**状态。
+   - **采纳**时系统在同一事务内核对：① 来源提示仍存在；② 剧本当前版本与场次冻结版本一致、
+     且提示仍绑定在快照行；③ 提示的**类型、内容、备注**与该条目快照完全一致。
+     任一条件不符即返回 **409 冲突**，建议被**保留**并标记为**冲突**（附原因），
+     **绝不覆盖排练后对提示的编辑**；待处理与冲突状态都会展示在执行台与历次场次列表中。
+   - 核对全部通过才把建议的内容/备注写回**当前提示**并标记建议**已采纳**；
+     场次的冻结条目快照与执行记录始终保持原样，已采纳的建议作为历史保留，不可再改。
 
 ---
 
@@ -125,6 +135,11 @@ npm start            # 启动，访问 http://localhost:3000
 - `session_items`：场次冻结条目（序号、来源提示 ID、行号、类型、内容、备注、锚点台词文本）；
   不与 `cues` 建外键，提示日后被编辑或删除不影响旧场次
 - `session_executions`：执行记录（条目、顺序号、执行时间），`(场次, 条目)` 唯一，防止重复执行
+- `session_item_suggestions`：场次条目修订建议（建议的新内容/备注；`pending` / `adopted` / `conflict`
+  状态及冲突原因），挂在场次与条目下，随场次级联删除；采纳时事务内核对来源提示与快照一致才回写 `cues`
+
+> 数据库随服务启动自动建表（`CREATE TABLE IF NOT EXISTS`）：旧版本创建的卷在升级后首次启动时
+> 会自动补齐 `session_item_suggestions` 表，无需手工迁移。
 
 ## 排练场次 API
 
@@ -132,7 +147,11 @@ npm start            # 启动，访问 http://localhost:3000
 | --- | --- |
 | `GET /api/scripts/:id/sessions/preview` | 创建前预览：当前版本、可执行条目数、待确认排除数 |
 | `POST /api/scripts/:id/sessions` | 从当前版本创建场次（无可执行提示返回 `409`） |
-| `GET /api/scripts/:id/sessions` | 历次场次列表（含进度摘要） |
-| `GET /api/sessions/:sessionId` | 场次详情：冻结条目快照 + 执行记录 |
+| `GET /api/scripts/:id/sessions` | 历次场次列表（含进度摘要与待处理/冲突建议计数） |
+| `GET /api/sessions/:sessionId` | 场次详情：冻结条目快照 + 执行记录 + 修订建议 |
 | `POST /api/sessions/:sessionId/execute` | 执行队首，请求体 `{ itemId, expectedProgress }`；过期/重复/越序返回 `409` |
 | `POST /api/sessions/:sessionId/undo` | 撤回最后一条，请求体 `{ expectedProgress }` |
+| `POST /api/sessions/:sessionId/items/:itemId/suggestions` | 为冻结条目提交修订建议，请求体 `{ label, note }` |
+| `PATCH /api/suggestions/:suggestionId` | 修改建议内容/备注（仅未采纳；修改后重置为待处理） |
+| `DELETE /api/suggestions/:suggestionId` | 删除建议（已采纳的作为历史保留，返回 `409`） |
+| `POST /api/suggestions/:suggestionId/adopt` | 采纳建议：事务内核对来源提示存在、剧本版本与绑定行未变、类型/内容/备注与快照一致；不符则标记冲突并返回 `409`（建议保留），通过才写回当前提示并标记已采纳 |

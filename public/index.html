@@ -142,6 +142,25 @@
     </div>
   </div>
 
+  <!-- 修订建议弹窗（针对冻结的场次条目） -->
+  <div id="suggestModal" class="modal-mask hidden">
+    <div class="modal">
+      <h3 id="suggestModalTitle">填写修订建议</h3>
+      <div class="modal-line" id="suggestItemInfo"></div>
+      <p class="hint" id="suggestModalHint">
+        建议保存在场次下，采纳时系统会核对来源提示未被改动，通过后才会写回当前提示。
+      </p>
+      <label class="field-label">建议的提示内容</label>
+      <input id="suggestLabel" class="input" type="text" placeholder="如：聚光灯提前 2 秒亮起" />
+      <label class="field-label">建议的备注（可选）</label>
+      <textarea id="suggestNote" class="textarea" rows="2" placeholder="执行细节、时长、通道等"></textarea>
+      <div class="modal-actions">
+        <button class="btn" id="suggestCancelBtn">取消</button>
+        <button class="btn btn-primary" id="suggestSaveBtn">保存建议</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="app.js"></script>
